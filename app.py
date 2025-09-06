@@ -9,18 +9,12 @@ from collections import defaultdict
 import logging, sys, json
 
 # ---------------- Logging ----------------
-handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-handler.setFormatter(formatter)
-
 logger = logging.getLogger("xml2xlsx")
 logger.setLevel(logging.INFO)
-logger.addHandler(handler)
+h = logging.StreamHandler(sys.stdout)
+h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.handlers[:] = [h]
 
-# Example usage
-logger.info("service_started")
-logger.info(json.dumps({"event": "job_start", "job_id": job_id, "files": len(blobs)}))
-logger.error(json.dumps({"event": "job_error", "job_id": job_id, "error": str(e)}))
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)")
 
@@ -183,7 +177,7 @@ INDEX_HTML = """
 <body>
   <div class="card">
     <h1>Simple XML → Excel Converter</h1>
-    <div class="muted">Upload one or more XML files. The app auto-detects the repeating element (no TxId needed), flattens nested fields into columns, and returns a ZIP of Excel files.</div>
+    <div class="muted">Upload one or more XML files. The app auto-detects the repeating element, flattens nested fields into columns, and returns a ZIP of Excel files.</div>
 
     <div class="row">
       <strong>1) Upload XML files</strong><br/>
@@ -204,7 +198,7 @@ INDEX_HTML = """
 
     <div class="row">
       <div class="progress"><div class="bar" id="bar"></div></div>
-      <div id="status" class="muted" style="margin-top:6px">Idle</div>
+      <div id="status" class="muted" style="margin-top:6px"> File limit is 30-50 mb, if above please upload multiple files separately </div>
     </div>
   </div>
 
@@ -279,14 +273,6 @@ async def index():
 
 @app.post("/start")
 async def start(files: List[UploadFile] = File(...), aliases: str = Form("{}")):
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-    try:
-        alias_map = json.loads(aliases) if aliases else {}
-    except Exception:
-        raise HTTPException(status_code=400, detail="Aliases must be valid JSON")
-
-    # Read files to bytes now (UploadFile streams will close)
     blobs = []
     for f in files:
         if not f.filename.lower().endswith(".xml"):
@@ -295,6 +281,14 @@ async def start(files: List[UploadFile] = File(...), aliases: str = Form("{}")):
         blobs.append((f.filename, data))
 
     job_id = str(int(time.time() * 1000))
+
+    # ✅ log here (variables exist)
+    logger.info(json.dumps({
+        "event": "job_start",
+        "job_id": job_id,
+        "files": len(blobs)
+    }))
+
     JOBS[job_id] = {
         "total": len(blobs),
         "index": 0,
@@ -315,6 +309,10 @@ def _run_job(job_id: str, blobs: List[tuple], aliases: Dict[str, str]):
         out_zip = io.BytesIO()
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, (name, data) in enumerate(blobs, start=1):
+                logger.info(json.dumps({
+                    "event": "file_start", "job_id": job_id, "index": i, "total": total, "file": name
+                }))
+
                 JOBS[job_id].update({"index": i, "file": name, "stage": "parsing"})
                 # parse and flatten
                 df = xml_rows_to_dataframe(data)
@@ -334,18 +332,27 @@ def _run_job(job_id: str, blobs: List[tuple], aliases: Dict[str, str]):
                             start = end
                     else:
                         df.to_excel(writer, index=False, sheet_name="Rows")
+
                 xlsx_buf.seek(0)
                 base = os.path.splitext(os.path.basename(name))[0]
                 zf.writestr(f"{base}.xlsx", xlsx_buf.read())
                 JOBS[job_id]["stage"] = "written"
+
+                logger.info(json.dumps({
+                    "event": "file_done", "job_id": job_id, "index": i, "file": name
+                }))
+
         out_zip.seek(0)
         JOBS[job_id].update({"zip_bytes": out_zip, "done": True, "stage": "complete"})
+        logger.info(json.dumps({"event": "job_complete", "job_id": job_id, "files": total}))
     except Exception as e:
         JOBS[job_id].update({"error": str(e), "done": True, "stage": "error"})
+        logger.exception(json.dumps({"event": "job_error", "job_id": job_id, "error": str(e)}))
 
 @app.get("/progress/{job_id}")
 async def progress(job_id: str):
     if job_id not in JOBS:
+        logger.warning(json.dumps({"event":"progress_unknown_job","job_id":job_id}))
         return StreamingResponse(iter([sse("error", {"error": "unknown job"})]), media_type="text/event-stream")
 
     def gen():
