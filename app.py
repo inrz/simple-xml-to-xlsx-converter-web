@@ -1,25 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
+# app.py
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, Response, FileResponse
+from typing import List, Dict
 import pandas as pd
 import xml.etree.ElementTree as ET
-import io
-import time
-from collections import defaultdict, Counter
+import io, time, os, json, threading, zipfile
+from collections import defaultdict
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)")
 
-# ----------- XML helpers (namespace-agnostic) -----------
+# ---------------- XML helpers (namespace-agnostic) ----------------
 
 def localname(tag: str) -> str:
     return tag.split('}', 1)[1] if '}' in tag else tag
 
 def element_to_dict(el: ET.Element):
     """
-    Recursively convert an Element to Python primitives.
-    - Namespace stripped from tag names
-    - Attributes become keys with '@' prefix
-    - Repeated child tags become lists
-    - Leaf text -> str (or None)
+    Element -> Python primitives:
+      - strip namespaces
+      - attributes => '@attr'
+      - repeated child tags => list
+      - leaf text => str or None
     """
     data = {}
     if el.attrib:
@@ -45,9 +46,7 @@ def element_to_dict(el: ET.Element):
         return txt if txt != "" else None
 
 def flatten_dict_all(obj, parent_key: str = "") -> dict:
-    """
-    Flatten nested dicts/lists into dotted keys; lists indexed with [i].
-    """
+    """Flatten nested dicts/lists into dotted keys; lists indexed with [i]."""
     flat = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -67,50 +66,35 @@ def flatten_dict_all(obj, parent_key: str = "") -> dict:
             flat[parent_key] = obj
     return flat
 
-# ----------- Row detection (repeating pattern) -----------
-
 def detect_repeating_rows(root: ET.Element):
     """
-    Find the most repeated child tag among siblings anywhere in the tree.
-    Returns the list of matching elements to treat as rows.
-    Heuristic:
+    Heuristic to find a repeating element (row type):
       - For each parent, group its direct children by localname.
-      - Keep groups with count >= 2 (repeated).
-      - Pick the group with the highest count; tie-breaker = deepest parent.
+      - Candidate groups have count >= 2 (repeated siblings).
+      - Choose the group with the highest count; tie-breaker = deepest parent.
     Fallbacks:
-      - If nothing repeats, use root's direct children (if any), else [root].
+      - If nothing repeats, use root's direct children, else [root].
     """
-    best = {
-        "count": 0,
-        "depth": -1,
-        "name": None,
-        "elems": None,
-    }
-
-    # DFS stack to compute depth
+    best = {"count": 0, "depth": -1, "name": None, "elems": None}
     stack = [(root, 0)]
     while stack:
         parent, depth = stack.pop()
         children = list(parent)
         if children:
-            # group children by local localname
             groups = defaultdict(list)
             for ch in children:
                 groups[localname(ch.tag)].append(ch)
-            # evaluate repeating groups
             for name, els in groups.items():
                 c = len(els)
-                if c >= 2:  # repeating siblings → candidate row set
+                if c >= 2:
                     if (c > best["count"]) or (c == best["count"] and depth > best["depth"]):
                         best = {"count": c, "depth": depth, "name": name, "elems": els}
-            # continue traversal
             for ch in children:
                 stack.append((ch, depth + 1))
 
     if best["elems"] is not None:
         return best["elems"]
 
-    # fallbacks
     rc = list(root)
     if rc:
         return rc
@@ -119,107 +103,266 @@ def detect_repeating_rows(root: ET.Element):
 def xml_rows_to_dataframe(xml_bytes: bytes) -> pd.DataFrame:
     root = ET.fromstring(xml_bytes)
     row_elems = detect_repeating_rows(root)
-
     rows = []
     for el in row_elems:
-        obj = element_to_dict(el)   # nested dict for the row
+        obj = element_to_dict(el)
         flat = flatten_dict_all(obj)
         rows.append(flat)
-
     df = pd.DataFrame(rows)
-
-    # If there's an obvious id/key field (e.g., *Id or id), move it first.
-    # This is optional; purely cosmetic.
     if not df.empty:
-        preferred = None
-        for key in df.columns:
-            lk = key.lower()
-            if lk.endswith("id") or lk == "id" or lk.endswith(".id"):
-                preferred = key
-                break
-        if preferred:
-            cols = [preferred] + [c for c in df.columns if c != preferred]
-            df = df.reindex(columns=cols)
-
+        df = df.reindex(columns=sorted(df.columns))
     return df
 
-# ----------- FastAPI routes -----------
+def apply_aliases(df: pd.DataFrame, aliases: Dict[str, str]) -> pd.DataFrame:
+    """aliases: { 'Original.Path': 'New Header', ... }"""
+    if not aliases or df.empty:
+        return df
+    rename_map = {k: v for k, v in aliases.items() if k in df.columns and v}
+    return df.rename(columns=rename_map) if rename_map else df
+
+# ---------------- Job registry for progress (in-memory) ----------------
+
+JOBS: Dict[str, dict] = {}
+# JOB:
+# {
+#   'total': int,
+#   'index': int,
+#   'stage': str,
+#   'file': str|None,
+#   'done': bool,
+#   'error': str|None,
+#   'zip_bytes': io.BytesIO|None
+# }
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+# ---------------- HTML (GUI) ----------------
+
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Simple XML → Excel Converter (Web)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#111;margin:24px}
+    .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;max-width:980px}
+    h1{margin:0 0 6px}
+    .muted{color:#6b7280}
+    .row{margin:12px 0}
+    input[type=file]{padding:8px;border:1px solid #d1d5db;border-radius:8px;width:100%}
+    textarea{width:100%;min-height:120px;font-family:ui-monospace,Menlo,Consolas,monospace}
+    button{background:#2563eb;color:#fff;border:0;padding:10px 14px;border-radius:8px;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .progress{height:12px;background:#eee;border-radius:999px;overflow:hidden}
+    .bar{height:100%;width:0%;background:#16a34a;transition:width .15s}
+    .right{text-align:right}
+    .pill{display:inline-block;background:#eef2ff;color:#3730a3;padding:2px 8px;border-radius:999px;font-size:12px}
+    .files{font-size:.9em;margin-top:6px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media(max-width:900px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Simple XML → Excel Converter</h1>
+    <div class="muted">Upload one or more XML files. The app auto-detects the repeating element (no TxId needed), flattens nested fields into columns, and returns a ZIP of Excel files.</div>
+
+    <div class="row">
+      <strong>1) Upload XML files</strong><br/>
+      <input id="files" type="file" accept=".xml" multiple />
+      <div class="files" id="fileList"></div>
+    </div>
+
+    <div class="row">
+      <strong>2) Column mapping (optional)</strong> <span class="pill">aliases JSON</span>
+      <div class="muted">Example: {"Tx.TradDt": "Trade Date", "FinInstrm.Othr.FinInstrmGnlAttrbts.FullNm": "Instrument Name"}</div>
+      <textarea id="aliases" placeholder='{"Tx.TradDt": "Trade Date"}'></textarea>
+    </div>
+
+    <div class="row grid">
+      <div><button id="startBtn">Start Conversion</button></div>
+      <div class="right"><a id="downloadLink" style="display:none" download>⬇️ Download results</a></div>
+    </div>
+
+    <div class="row">
+      <div class="progress"><div class="bar" id="bar"></div></div>
+      <div id="status" class="muted" style="margin-top:6px">Idle</div>
+    </div>
+  </div>
+
+<script>
+const filesInput = document.getElementById('files');
+const fileList = document.getElementById('fileList');
+const startBtn = document.getElementById('startBtn');
+const aliasesEl = document.getElementById('aliases');
+const bar = document.getElementById('bar');
+const statusEl = document.getElementById('status');
+const downloadLink = document.getElementById('downloadLink');
+
+filesInput.addEventListener('change', () => {
+  const names = Array.from(filesInput.files).map(f => f.name);
+  fileList.textContent = names.length ? names.join(', ') : 'No files selected';
+});
+
+startBtn.addEventListener('click', async () => {
+  if (!filesInput.files.length) { alert('Please choose at least one XML file.'); return; }
+
+  let aliases = {};
+  const txt = aliasesEl.value.trim();
+  if (txt) {
+    try { aliases = JSON.parse(txt); } catch(e) { alert('Aliases must be valid JSON.'); return; }
+  }
+
+  const form = new FormData();
+  for (const f of filesInput.files) form.append('files', f);
+  form.append('aliases', JSON.stringify(aliases));
+
+  startBtn.disabled = true; bar.style.width = '0%'; statusEl.textContent = 'Uploading…'; downloadLink.style.display='none';
+
+  const r = await fetch('/start', { method: 'POST', body: form });
+  if (!r.ok) { alert('Failed to start job'); startBtn.disabled = false; return; }
+  const { job_id } = await r.json();
+
+  const es = new EventSource(`/progress/${job_id}`);
+  es.addEventListener('update', (ev) => {
+    const info = JSON.parse(ev.data);
+    const { total, index, stage, file, percent } = info;
+    bar.style.width = `${percent}%`;
+    statusEl.textContent = `${stage} – ${index}/${total} ${file || ''}`;
+  });
+  es.addEventListener('done', (ev) => {
+    es.close();
+    const data = JSON.parse(ev.data);
+    const url = `/download/${data.job_id}`;
+    downloadLink.href = url;
+    downloadLink.style.display = 'inline-block';
+    statusEl.textContent = 'Done!';
+    bar.style.width = '100%';
+    startBtn.disabled = false;
+  });
+  es.addEventListener('error', (ev) => {
+    es.close();
+    const data = JSON.parse(ev.data);
+    alert('Error: ' + data.error);
+    statusEl.textContent = 'Error';
+    startBtn.disabled = false;
+  });
+});
+</script>
+</body>
+</html>
+"""
+
+# ---------------- Routes ----------------
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <title>Simple XML to Excel Converter</title>
-        <style>
-          body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 2rem; max-width: 720px; margin:auto;}
-          .card{border:1px solid #e5e7eb; border-radius:12px; padding:1.5rem; box-shadow:0 1px 2px rgba(0,0,0,.04)}
-          h1{margin-top:0}
-          input[type=file]{padding:.75rem; border:1px solid #d1d5db; border-radius:8px; width:100%;}
-          button{background:#16a34a; color:white; border:none; padding:.75rem 1rem; border-radius:8px; cursor:pointer;}
-          button:hover{background:#15803d}
-          .muted{color:#6b7280; font-size:.9rem}
-          .row{display:flex; gap:1rem; align-items:center; margin-top:1rem}
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>Simple XML to Excel Converter</h1>
-          <p class="muted">Upload an XML file. The app auto-detects a repeating element pattern and turns each instance into a row; all nested fields become columns.</p>
-          <form action="/convert" method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept=".xml" required />
-            <div class="row">
-              <button type="submit">Convert to Excel</button>
-              <span class="muted">Free-tier tip: keep files &lt;~30–50MB.</span>
-            </div>
-          </form>
-        </div>
-      </body>
-    </html>
-    """
+    return INDEX_HTML
 
-@app.post("/convert")
-async def convert(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".xml"):
-        raise HTTPException(status_code=400, detail="Please upload a .xml file")
-
-    xml_bytes = await file.read()
-    if len(xml_bytes) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File too large for free tier (limit ~50MB).")
-
+@app.post("/start")
+async def start(files: List[UploadFile] = File(...), aliases: str = Form("{}")):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
     try:
-        df = xml_rows_to_dataframe(xml_bytes)
-    except ET.ParseError:
-        raise HTTPException(status_code=400, detail="Invalid XML file")
+        alias_map = json.loads(aliases) if aliases else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Aliases must be valid JSON")
+
+    # Read files to bytes now (UploadFile streams will close)
+    blobs = []
+    for f in files:
+        if not f.filename.lower().endswith(".xml"):
+            raise HTTPException(status_code=400, detail=f"Only .xml files allowed: {f.filename}")
+        data = await f.read()
+        blobs.append((f.filename, data))
+
+    job_id = str(int(time.time() * 1000))
+    JOBS[job_id] = {
+        "total": len(blobs),
+        "index": 0,
+        "stage": "queued",
+        "file": None,
+        "done": False,
+        "error": None,
+        "zip_bytes": None,
+    }
+
+    t = threading.Thread(target=_run_job, args=(job_id, blobs, alias_map), daemon=True)
+    t.start()
+    return {"job_id": job_id}
+
+def _run_job(job_id: str, blobs: List[tuple], aliases: Dict[str, str]):
+    try:
+        total = len(blobs)
+        out_zip = io.BytesIO()
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, (name, data) in enumerate(blobs, start=1):
+                JOBS[job_id].update({"index": i, "file": name, "stage": "parsing"})
+                # parse and flatten
+                df = xml_rows_to_dataframe(data)
+                # apply aliases
+                df = apply_aliases(df, aliases)
+                # write xlsx
+                xlsx_buf = io.BytesIO()
+                with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+                    MAX_COLS = 16384
+                    if df.shape[1] > MAX_COLS:
+                        start = 0
+                        part = 1
+                        while start < df.shape[1]:
+                            end = min(start + MAX_COLS, df.shape[1])
+                            df.iloc[:, start:end].to_excel(writer, index=False, sheet_name=f"Rows_{part}")
+                            part += 1
+                            start = end
+                    else:
+                        df.to_excel(writer, index=False, sheet_name="Rows")
+                xlsx_buf.seek(0)
+                base = os.path.splitext(os.path.basename(name))[0]
+                zf.writestr(f"{base}.xlsx", xlsx_buf.read())
+                JOBS[job_id]["stage"] = "written"
+        out_zip.seek(0)
+        JOBS[job_id].update({"zip_bytes": out_zip, "done": True, "stage": "complete"})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Conversion error: {e}")
+        JOBS[job_id].update({"error": str(e), "done": True, "stage": "error"})
 
-    # Write in-memory Excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        MAX_COLS = 16384
-        if df.shape[1] > MAX_COLS:
-            start = 0
-            part = 1
-            while start < df.shape[1]:
-                end = min(start + MAX_COLS, df.shape[1])
-                df.iloc[:, start:end].to_excel(writer, index=False, sheet_name=f"Rows_{part}")
-                part += 1
-                start = end
-        else:
-            df.to_excel(writer, index=False, sheet_name="Rows")
+@app.get("/progress/{job_id}")
+async def progress(job_id: str):
+    if job_id not in JOBS:
+        return StreamingResponse(iter([sse("error", {"error": "unknown job"})]), media_type="text/event-stream")
 
-    output.seek(0)
-    stamp = int(time.time())
-    base_filename = file.filename.rsplit(".", 1)[0] if file.filename else "converted"
-    filename = f"{base_filename}_{stamp}.xlsx"
+    def gen():
+        total = JOBS[job_id]["total"]
+        while True:
+            j = JOBS[job_id]
+            idx = j["index"]
+            stage = j["stage"]
+            fname = j["file"]
+            done = j["done"]
+            err = j["error"]
+            percent = int((idx / total) * 100) if total else 0
+            if err:
+                yield sse("error", {"error": err})
+                return
+            if done and stage == "complete":
+                yield sse("done", {"job_id": job_id})
+                return
+            yield sse("update", {"total": total, "index": idx, "stage": stage, "file": fname, "percent": percent})
+            time.sleep(0.4)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+@app.get("/download/{job_id}")
+async def download(job_id: str):
+    j = JOBS.get(job_id)
+    if not j or not j.get("zip_bytes"):
+        raise HTTPException(status_code=404, detail="Not ready")
     return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        j["zip_bytes"],
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="converted_excels.zip"'},
     )
 
 @app.get("/health", response_class=PlainTextResponse)
