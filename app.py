@@ -6,6 +6,21 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 import io, time, os, json, threading, zipfile
 from collections import defaultdict
+import logging, sys, json
+
+# ---------------- Logging ----------------
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+handler.setFormatter(formatter)
+
+logger = logging.getLogger("xml2xlsx")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+
+# Example usage
+logger.info("service_started")
+logger.info(json.dumps({"event": "job_start", "job_id": job_id, "files": len(blobs)}))
+logger.error(json.dumps({"event": "job_error", "job_id": job_id, "error": str(e)}))
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)")
 
