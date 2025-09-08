@@ -307,6 +307,7 @@ async def download(job_id: str):
     j = JOBS.get(job_id)
     if not j or not j.get("zip_bytes"):
         raise HTTPException(status_code=404, detail="Not ready")
+    j["zip_bytes"].seek(0)  # reset stream so multiple downloads work
     return StreamingResponse(
         j["zip_bytes"],
         media_type="application/zip",
