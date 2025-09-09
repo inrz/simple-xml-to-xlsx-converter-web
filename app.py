@@ -4,6 +4,7 @@ from typing import List, Dict
 import pandas as pd
 import xml.etree.ElementTree as ET
 import io, time, os, threading, zipfile, json
+import asyncio
 from collections import defaultdict
 import logging
 
@@ -298,7 +299,7 @@ async def progress(job_id: str):
     if job_id not in JOBS:
         return StreamingResponse(iter([sse("error", {"error": "unknown job"})]), media_type="text/event-stream")
 
-    def gen():
+    async def gen():
         total = JOBS[job_id]["total"]
         while True:
             j = JOBS[job_id]
@@ -313,7 +314,7 @@ async def progress(job_id: str):
             if done and stage == "complete":
                 yield sse("done", {"job_id": job_id}); return
             yield sse("update", {"total": total, "index": idx, "stage": stage, "file": fname, "percent": percent})
-            time.sleep(0.4)
+            await asyncio.sleep(0.4)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -325,6 +326,7 @@ async def download(job_id: str):
         logger.info("Download for job %s not ready", job_id)
         raise HTTPException(status_code=404, detail="Not ready")
     logger.info("Serving download for job %s", job_id)
+    j["zip_bytes"].seek(0)  # reset stream so multiple downloads work
     return StreamingResponse(
         j["zip_bytes"],
         media_type="application/zip",
