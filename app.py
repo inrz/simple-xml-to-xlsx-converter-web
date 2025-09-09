@@ -1,130 +1,19 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, FileResponse
 from typing import List, Dict
-import pandas as pd
-import xml.etree.ElementTree as ET
-import io, time, os, threading, zipfile, json
-import asyncio
-from collections import defaultdict
-import logging
+import io, time, os, threading, zipfile, json, uuid
+from celery.result import AsyncResult
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from core import xml_rows_to_dataframe  # parsing utils live in core.py
+from tasks import celery, convert_task   # celery app + background task
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)")
 
-
-@app.exception_handler(Exception)
-async def handler(request: Request, exc: Exception):
-    logger.exception("Unhandled error")
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-
-# ----------- XML helpers (namespace-agnostic) -----------
-
-def localname(tag: str) -> str:
-    return tag.split('}', 1)[1] if '}' in tag else tag
-
-def element_to_dict(el: ET.Element):
-    """Element -> Python primitives (strip ns, attrs as @, lists for repeats)."""
-    data = {}
-    if el.attrib:
-        for k, v in el.attrib.items():
-            data[f"@{localname(k)}"] = v
-
-    kids = list(el)
-    if kids:
-        buckets = {}
-        for c in kids:
-            k = localname(c.tag)
-            v = element_to_dict(c)
-            if k in buckets:
-                if not isinstance(buckets[k], list):
-                    buckets[k] = [buckets[k]]
-                buckets[k].append(v)
-            else:
-                buckets[k] = v
-        data.update(buckets)
-        return data
-    else:
-        txt = (el.text or "").strip()
-        return txt if txt != "" else None
-
-def flatten_dict_all(obj, parent_key: str = "") -> dict:
-    """Flatten nested dicts/lists into dotted keys; lists indexed with [i]."""
-    flat = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            nk = f"{parent_key}.{k}" if parent_key else k
-            if isinstance(v, dict):
-                flat.update(flatten_dict_all(v, nk))
-            elif isinstance(v, list):
-                for i, item in enumerate(v):
-                    flat.update(flatten_dict_all(item, f"{nk}[{i}]"))
-            else:
-                flat[nk] = v
-    elif isinstance(obj, list):
-        for i, item in enumerate(obj):
-            flat.update(flatten_dict_all(item, f"{parent_key}[{i}]" if parent_key else f"[{i}]"))
-    else:
-        if parent_key:
-            flat[parent_key] = obj
-    return flat
-
-# ----------- Row detection (repeating pattern) -----------
-
-def detect_repeating_rows(root: ET.Element):
-    """
-    Find a repeated child tag among siblings (no TxId dependency).
-    - For each parent, group its direct children by localname, keep count >=2.
-    - Choose highest count; tie-breaker: deepest parent.
-    Fall back to root children, else [root].
-    """
-    best = {"count": 0, "depth": -1, "name": None, "elems": None}
-    stack = [(root, 0)]
-    while stack:
-        parent, depth = stack.pop()
-        children = list(parent)
-        if children:
-            groups = defaultdict(list)
-            for ch in children:
-                groups[localname(ch.tag)].append(ch)
-            for name, els in groups.items():
-                c = len(els)
-                if c >= 2:
-                    if (c > best["count"]) or (c == best["count"] and depth > best["depth"]):
-                        best = {"count": c, "depth": depth, "name": name, "elems": els}
-            for ch in children:
-                stack.append((ch, depth + 1))
-    if best["elems"] is not None:
-        return best["elems"]
-    rc = list(root)
-    return rc if rc else [root]
-
-def xml_rows_to_dataframe(xml_bytes: bytes) -> pd.DataFrame:
-    root = ET.fromstring(xml_bytes)
-    row_elems = detect_repeating_rows(root)
-    rows = []
-    for el in row_elems:
-        obj = element_to_dict(el)
-        flat = flatten_dict_all(obj)
-        rows.append(flat)
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.reindex(columns=sorted(df.columns))  # deterministic order
-    return df
-
-# ----------- In-memory jobs for progress -----------
-
-JOBS: Dict[str, dict] = {}
-# JOBS[job_id] = {
-#   "total": int, "index": int, "stage": str, "file": str|None,
-#   "done": bool, "error": str|None, "zip_bytes": io.BytesIO|None
-# }
-
+# ----------- In-memory helper for SSE formatting (kept for symmetry) -----------
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
-# ----------- UI (same style) -----------
+# ----------- UI (kept same style, plus Preview/Column picker/Format) -----------
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -136,7 +25,7 @@ async def index():
         <meta name="viewport" content="width=device-width, initial-scale=1"/>
         <title>Simple XML to Excel Converter</title>
         <style>
-          body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 2rem; max-width: 720px; margin:auto;}
+          body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 2rem; max-width: 900px; margin:auto;}
           .card{border:1px solid #e5e7eb; border-radius:12px; padding:1.5rem; box-shadow:0 1px 2px rgba(0,0,0,.04)}
           h1{margin-top:0}
           input[type=file]{padding:.75rem; border:1px solid #d1d5db; border-radius:8px; width:100%;}
@@ -147,6 +36,13 @@ async def index():
           .progress{height:12px; background:#eee; border-radius:999px; overflow:hidden; margin-top:12px}
           .bar{height:100%; width:0%; background:#16a34a; transition:width .15s}
           .right{text-align:right}
+          /* modal */
+          .modal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none; align-items:center; justify-content:center; padding:1rem;}
+          .modal-content{background:#fff; border-radius:12px; padding:1rem; max-width:95vw; max-height:85vh; overflow:auto; box-shadow:0 10px 30px rgba(0,0,0,.2)}
+          table{border-collapse:collapse; width:100%; margin-bottom:1rem}
+          th,td{border:1px solid #e5e7eb; padding:.35rem; font-size:.9rem; vertical-align:top}
+          th{background:#f8fafc; position:sticky; top:0}
+          #columnsContainer{max-height:220px; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; padding:.5rem;}
         </style>
       </head>
       <body>
@@ -156,182 +52,266 @@ async def index():
 
           <input id="files" type="file" accept=".xml" multiple />
           <div class="row">
-            <button id="startBtn">Convert</button>
+            <button id="previewBtn" type="button">Preview</button>
+            <button id="convertBtn" type="button" style="display:none;">Export</button>
             <span class="muted" id="hint">You can select multiple files.</span>
+            <div class="right" style="margin-left:auto;"><a id="downloadLink" style="display:none;" download>⬇️ Download results</a></div>
+          </div>
+
+          <div id="columnOptions" style="display:none; margin-top: 1rem;">
+            <p class="muted">Select columns to include:</p>
+            <div id="columnsContainer"></div>
+            <p class="muted" style="margin-top:.5rem;">
+              Output format:
+              <select id="formatSelect">
+                <option value="xlsx">XLSX (Excel)</option>
+                <option value="csv">CSV</option>
+                <option value="parquet">Parquet</option>
+              </select>
+            </p>
           </div>
 
           <div class="progress"><div class="bar" id="bar"></div></div>
           <div class="muted" id="status">Idle</div>
+        </div>
 
-          <div class="row" style="justify-content:space-between;">
-            <div class="muted" id="selected"></div>
-            <div class="right"><a id="downloadLink" style="display:none;" download>⬇️ Download results</a></div>
+        <!-- Modal -->
+        <div class="modal" id="previewModal">
+          <div class="modal-content">
+            <h3>Preview (first 10 rows)</h3>
+            <div id="previewTables"></div>
+            <div class="row" style="justify-content:flex-end;">
+              <button id="closePreviewBtn" type="button">Continue</button>
+            </div>
           </div>
         </div>
 
         <script>
           const filesInput = document.getElementById('files');
-          const startBtn = document.getElementById('startBtn');
+          const previewBtn = document.getElementById('previewBtn');
+          const convertBtn = document.getElementById('convertBtn');
           const statusEl = document.getElementById('status');
-          const selectedEl = document.getElementById('selected');
           const bar = document.getElementById('bar');
           const downloadLink = document.getElementById('downloadLink');
+          const columnOptions = document.getElementById('columnOptions');
+          const columnsContainer = document.getElementById('columnsContainer');
+          const formatSelect = document.getElementById('formatSelect');
+          const previewModal = document.getElementById('previewModal');
+          const previewTables = document.getElementById('previewTables');
+          const closePreviewBtn = document.getElementById('closePreviewBtn');
+
+          let lastPreviewData = null;
 
           filesInput.addEventListener('change', () => {
-            const names = Array.from(filesInput.files).map(f => f.name);
-            selectedEl.textContent = names.length ? names.join(', ') : '';
+            downloadLink.style.display = 'none';
+            statusEl.textContent = 'Idle';
+            columnOptions.style.display = 'none';
+            convertBtn.style.display = 'none';
+            bar.style.width = '0%';
           });
 
-          startBtn.addEventListener('click', async () => {
-            if (!filesInput.files.length) { alert('Please choose at least one XML file.'); return; }
+          previewBtn.addEventListener('click', async () => {
+            if (!filesInput.files.length) { alert('Please select at least one XML file.'); return; }
+            const formData = new FormData();
+            for (const f of filesInput.files) formData.append('files', f);
+            previewBtn.disabled = true;
+            statusEl.textContent = 'Generating preview...';
+            try {
+              const res = await fetch('/preview', { method: 'POST', body: formData });
+              if (!res.ok) throw new Error((await res.json()).detail || 'Preview failed');
+              lastPreviewData = await res.json();
+            } catch (err) {
+              alert('Error: ' + err.message);
+              previewBtn.disabled = false; statusEl.textContent = 'Idle'; return;
+            }
+            // Build preview tables
+            previewTables.innerHTML = '';
+            lastPreviewData.files.forEach(file => {
+              const cols = file.columns;
+              const rows = file.rows;
+              let tableHTML = '<h4>' + file.name + '</h4>';
+              tableHTML += '<div style="overflow:auto; max-height:50vh;"><table><thead><tr>';
+              cols.forEach(col => { tableHTML += `<th>${col}</th>`; });
+              tableHTML += '</tr></thead><tbody>';
+              rows.forEach(row => {
+                tableHTML += '<tr>';
+                cols.forEach((col, j) => {
+                  let cell = row[j]; if (cell === null) cell = '';
+                  tableHTML += `<td>${cell}</td>`;
+                });
+                tableHTML += '</tr>';
+              });
+              tableHTML += '</tbody></table></div>';
+              previewTables.innerHTML += tableHTML;
+            });
+            // Populate columns
+            columnsContainer.innerHTML = '';
+            lastPreviewData.columns.forEach(col => {
+              const id = 'col_' + col.replace(/[^a-zA-Z0-9_\\-\\.]/g, '_');
+              columnsContainer.innerHTML += `<label><input type="checkbox" id="${id}" value="${col}" checked> ${col}</label><br>`;
+            });
+            // Show modal
+            previewModal.style.display = 'flex';
+            previewBtn.disabled = false;
+          });
 
-            const form = new FormData();
-            for (const f of filesInput.files) form.append('files', f);
+          closePreviewBtn.addEventListener('click', () => {
+            previewModal.style.display = 'none';
+            columnOptions.style.display = 'block';
+            convertBtn.style.display = 'inline-block';
+            statusEl.textContent = 'Preview ready. Select columns and format, then click Export.';
+          });
 
-            startBtn.disabled = true;
-            bar.style.width = '0%';
-            statusEl.textContent = 'Uploading…';
+          convertBtn.addEventListener('click', async () => {
+            if (!lastPreviewData) { alert('Please run the preview first.'); return; }
+            convertBtn.disabled = true; previewBtn.disabled = true;
+            // collect selected cols
+            const selectedCols = [];
+            lastPreviewData.columns.forEach(col => {
+              const id = 'col_' + col.replace(/[^a-zA-Z0-9_\\-\\.]/g, '_');
+              const cb = document.getElementById(id);
+              if (cb && cb.checked) selectedCols.push(col);
+            });
+            const format = formatSelect.value;
+            statusEl.textContent = 'Starting conversion...'; bar.style.width = '0%';
             downloadLink.style.display = 'none';
-
-            const r = await fetch('/start', { method: 'POST', body: form });
-            if (!r.ok) { alert('Failed to start job'); startBtn.disabled = false; return; }
-            const { job_id } = await r.json();
-
-            const es = new EventSource(`/progress/${job_id}`);
-            es.addEventListener('update', (ev) => {
-              const info = JSON.parse(ev.data);
-              const { total, index, stage, file, percent } = info;
-              bar.style.width = `${percent}%`;
-              statusEl.textContent = `${stage} – ${index}/${total} ${file || ''}`;
-            });
-            es.addEventListener('done', (ev) => {
-              es.close();
-              const data = JSON.parse(ev.data);
-              const url = `/download/${data.job_id}`;
-              downloadLink.href = url;
-              downloadLink.style.display = 'inline-block';
-              statusEl.textContent = 'Done!';
-              bar.style.width = '100%';
-              startBtn.disabled = false;
-            });
-            es.addEventListener('error', (ev) => {
-              es.close();
-              const data = JSON.parse(ev.data);
-              alert('Error: ' + data.error);
-              statusEl.textContent = 'Error';
-              startBtn.disabled = false;
-            });
+            const payload = {
+              file_ids: lastPreviewData.files.map(f => f.id),
+              file_names: lastPreviewData.files.map(f => f.name),
+              columns: selectedCols,
+              format: format
+            };
+            let jobId;
+            try {
+              const res = await fetch('/convert', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+              });
+              if (!res.ok) throw new Error((await res.json()).detail || 'Failed to start conversion');
+              const data = await res.json();
+              jobId = data.job_id;
+            } catch (err) {
+              alert('Error: ' + err.message);
+              statusEl.textContent = 'Error starting job';
+              convertBtn.disabled = false; previewBtn.disabled = false; return;
+            }
+            statusEl.textContent = 'Processing...';
+            // poll status
+            const timer = setInterval(async () => {
+              const r = await fetch(`/status/${jobId}`);
+              if (!r.ok) return;
+              const s = await r.json();
+              if (s.status === 'PROGRESS') {
+                const pct = s.progress || 0; bar.style.width = pct + '%';
+                if (s.total && s.total > 1) statusEl.textContent = `Processing ${s.file} (${s.current}/${s.total})`;
+                else statusEl.textContent = `Processing... ${pct}%`;
+              }
+              if (s.status === 'SUCCESS') {
+                clearInterval(timer);
+                bar.style.width = '100%'; statusEl.textContent = 'Done!';
+                downloadLink.href = `/download/${jobId}`; downloadLink.style.display = 'inline';
+                convertBtn.disabled = false; previewBtn.disabled = false;
+              }
+              if (s.status === 'FAILURE') {
+                clearInterval(timer);
+                statusEl.textContent = 'Error during conversion';
+                alert('Conversion failed: ' + (s.error || 'Unknown error'));
+                convertBtn.disabled = false; previewBtn.disabled = false;
+              }
+            }, 1000);
           });
         </script>
       </body>
     </html>
     """
 
-# ----------- API: start / progress / download -----------
+# ----------- Preview endpoint (returns 10 rows + union of columns) -----------
 
-@app.post("/start")
-async def start(files: List[UploadFile] = File(...)):
-    logger.info("Received start request with %d file(s)", len(files) if files else 0)
+@app.post("/preview")
+async def preview_files(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
-
-    # Read to memory (UploadFile streams close after request scope)
-    blobs = []
-    for f in files:
-        if not f.filename.lower().endswith(".xml"):
-            raise HTTPException(status_code=400, detail=f"Only .xml files allowed: {f.filename}")
-        data = await f.read()
+    os.makedirs("temp_uploads", exist_ok=True)
+    previews = []
+    all_columns = set()
+    for upload in files:
+        if not upload.filename.lower().endswith(".xml"):
+            raise HTTPException(status_code=400, detail=f"Only .xml files allowed: {upload.filename}")
+        data = await upload.read()
         if len(data) > 50 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"File too large: {f.filename}")
-        blobs.append((f.filename, data))
+            raise HTTPException(status_code=413, detail=f"File too large: {upload.filename}")
+        try:
+            df = xml_rows_to_dataframe(data)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Failed to parse {upload.filename}: {e}")
+        preview_df = df.head(10) if not df.empty else df
+        preview_df = preview_df.fillna("")
+        columns = list(preview_df.columns)
+        rows = preview_df.values.tolist()
+        file_id = str(uuid.uuid4())
+        with open(f"temp_uploads/{file_id}.xml", "wb") as f:
+            f.write(data)
+        previews.append({"id": file_id, "name": upload.filename, "columns": columns, "rows": rows})
+        all_columns.update(columns)
+    return {"files": previews, "columns": sorted(all_columns)}
 
-    job_id = str(int(time.time() * 1000))
-    JOBS[job_id] = {
-        "total": len(blobs),
-        "index": 0,
-        "stage": "queued",
-        "file": None,
-        "done": False,
-        "error": None,
-        "zip_bytes": None,
+# ----------- Background conversion via Celery -----------
+
+@app.post("/convert")
+async def start_conversion(payload: Dict):
+    try:
+        file_ids: List[str] = payload["file_ids"]
+        file_names: List[str] = payload["file_names"]
+        columns: List[str] = payload.get("columns", [])
+        fmt: str = payload.get("format", "xlsx")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    if not file_ids or not file_names or len(file_ids) != len(file_names):
+        raise HTTPException(status_code=400, detail="file_ids and file_names must be same length")
+    if fmt not in ("xlsx", "csv", "parquet"):
+        raise HTTPException(status_code=400, detail="format must be xlsx, csv, or parquet")
+
+    task = convert_task.delay(file_ids, file_names, columns, fmt)
+    return {"job_id": task.id}
+
+@app.get("/status/{job_id}")
+def get_status(job_id: str):
+    res = AsyncResult(job_id, app=celery)
+    status = res.status
+    if status == "SUCCESS":
+        return {"status": "SUCCESS"}
+    if status == "FAILURE":
+        error_msg = str(res.result)
+        return {"status": "FAILURE", "error": error_msg}
+    info = res.info or {}
+    return {
+        "status": "PROGRESS",
+        "progress": info.get("progress", 0),
+        "current": info.get("current", 0),
+        "total": info.get("total", 0),
+        "file": info.get("file", "")
     }
 
-    logger.info("Enqueued job %s", job_id)
-    t = threading.Thread(target=_run_job, args=(job_id, blobs), daemon=True)
-    t.start()
-    return {"job_id": job_id}
-
-def _run_job(job_id: str, blobs: List[tuple]):
-    logger.info("Running job %s", job_id)
-    try:
-        total = len(blobs)
-        out_zip = io.BytesIO()
-        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, (name, data) in enumerate(blobs, start=1):
-                JOBS[job_id].update({"index": i, "file": name, "stage": "parsing"})
-                # Parse → DataFrame
-                df = xml_rows_to_dataframe(data)
-                # Write one XLSX per XML
-                xlsx_buf = io.BytesIO()
-                with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-                    MAX_COLS = 16384
-                    if df.shape[1] > MAX_COLS:
-                        start = 0; part = 1
-                        while start < df.shape[1]:
-                            end = min(start + MAX_COLS, df.shape[1])
-                            df.iloc[:, start:end].to_excel(writer, index=False, sheet_name=f"Rows_{part}")
-                            part += 1; start = end
-                    else:
-                        df.to_excel(writer, index=False, sheet_name="Rows")
-                xlsx_buf.seek(0)
-                base = os.path.splitext(os.path.basename(name))[0]
-                zf.writestr(f"{base}.xlsx", xlsx_buf.read())
-                JOBS[job_id]["stage"] = "written"
-        out_zip.seek(0)
-        JOBS[job_id].update({"zip_bytes": out_zip, "done": True, "stage": "complete"})
-        logger.info("Job %s completed", job_id)
-    except Exception as e:
-        logger.exception("Job %s failed", job_id)
-        JOBS[job_id].update({"error": str(e), "done": True, "stage": "error"})
-
-@app.get("/progress/{job_id}")
-async def progress(job_id: str):
-    if job_id not in JOBS:
-        return StreamingResponse(iter([sse("error", {"error": "unknown job"})]), media_type="text/event-stream")
-
-    async def gen():
-        total = JOBS[job_id]["total"]
-        while True:
-            j = JOBS[job_id]
-            idx = j["index"]
-            stage = j["stage"]
-            fname = j["file"]
-            done = j["done"]
-            err = j["error"]
-            percent = int((idx / total) * 100) if total else 0
-            if err:
-                yield sse("error", {"error": err}); return
-            if done and stage == "complete":
-                yield sse("done", {"job_id": job_id}); return
-            yield sse("update", {"total": total, "index": idx, "stage": stage, "file": fname, "percent": percent})
-            await asyncio.sleep(0.4)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
 @app.get("/download/{job_id}")
-async def download(job_id: str):
-    logger.info("Download requested for job %s", job_id)
-    j = JOBS.get(job_id)
-    if not j or not j.get("zip_bytes"):
-        logger.info("Download for job %s not ready", job_id)
-        raise HTTPException(status_code=404, detail="Not ready")
-    logger.info("Serving download for job %s", job_id)
-    j["zip_bytes"].seek(0)  # reset stream so multiple downloads work
-    return StreamingResponse(
-        j["zip_bytes"],
-        media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="converted_excels.zip"'},
-    )
+def download_result(job_id: str):
+    base = f"outputs/{job_id}"
+    if os.path.exists(base + ".zip"):
+        return FileResponse(base + ".zip", media_type="application/zip", filename="converted_files.zip")
+    # single-file outputs
+    for ext, mime in [
+        ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("csv", "text/csv"),
+        ("parquet", "application/vnd.apache.parquet"),
+    ]:
+        p = f"{base}.{ext}"
+        if os.path.exists(p):
+            # try to pick friendly filename from result
+            res = AsyncResult(job_id, app=celery)
+            result_meta = res.result if res.status == "SUCCESS" else {}
+            download_name = result_meta.get("filename", f"converted.{ext}")
+            return FileResponse(p, media_type=mime, filename=download_name)
+    raise HTTPException(status_code=404, detail="Result not found")
 
 @app.get("/health", response_class=PlainTextResponse)
 async def health():

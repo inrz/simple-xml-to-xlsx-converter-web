@@ -1,8 +1,28 @@
 services:
   - type: web
-    name: simple-xml-to-excel
+    name: xml-to-excel-web
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-    autoDeploy: true
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          name: xml-to-excel-redis
+          type: redis
+          property: connectionString
+
+  - type: worker
+    name: xml-to-excel-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A tasks.celery worker --loglevel=info
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          name: xml-to-excel-redis
+          type: redis
+          property: connectionString
+
+  - type: redis
+    name: xml-to-excel-redis
+    ipAllowList: []  # private
