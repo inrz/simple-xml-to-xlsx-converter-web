@@ -1,10 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
-from typing import List, Dict
+from typing import List
+import asyncio
 import pandas as pd
 import xml.etree.ElementTree as ET
-import io, time, os, threading, zipfile, json
+import io, time, os, zipfile, json
 from collections import defaultdict
+
+from job_store import JobStore
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)")
 
@@ -102,13 +105,9 @@ def xml_rows_to_dataframe(xml_bytes: bytes) -> pd.DataFrame:
         df = df.reindex(columns=sorted(df.columns))  # deterministic order
     return df
 
-# ----------- In-memory jobs for progress -----------
+# ----------- Job storage -----------
 
-JOBS: Dict[str, dict] = {}
-# JOBS[job_id] = {
-#   "total": int, "index": int, "stage": str, "file": str|None,
-#   "done": bool, "error": str|None, "zip_bytes": io.BytesIO|None
-# }
+job_store = JobStore()
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -219,7 +218,7 @@ async def index():
 # ----------- API: start / progress / download -----------
 
 @app.post("/start")
-async def start(files: List[UploadFile] = File(...)):
+async def start(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
@@ -234,59 +233,53 @@ async def start(files: List[UploadFile] = File(...)):
         blobs.append((f.filename, data))
 
     job_id = str(int(time.time() * 1000))
-    JOBS[job_id] = {
-        "total": len(blobs),
-        "index": 0,
-        "stage": "queued",
-        "file": None,
-        "done": False,
-        "error": None,
-        "zip_bytes": None,
-    }
-
-    t = threading.Thread(target=_run_job, args=(job_id, blobs), daemon=True)
-    t.start()
+    job_store.create_job(job_id, total=len(blobs))
+    background_tasks.add_task(run_job, job_id, blobs)
     return {"job_id": job_id}
 
-def _run_job(job_id: str, blobs: List[tuple]):
+
+async def run_job(job_id: str, blobs: List[tuple]):
     try:
-        total = len(blobs)
         out_zip = io.BytesIO()
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, (name, data) in enumerate(blobs, start=1):
-                JOBS[job_id].update({"index": i, "file": name, "stage": "parsing"})
-                # Parse → DataFrame
+                job_store.update_job(job_id, index=i, file=name, stage="parsing")
                 df = xml_rows_to_dataframe(data)
-                # Write one XLSX per XML
                 xlsx_buf = io.BytesIO()
                 with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
                     MAX_COLS = 16384
                     if df.shape[1] > MAX_COLS:
-                        start = 0; part = 1
+                        start = 0
+                        part = 1
                         while start < df.shape[1]:
                             end = min(start + MAX_COLS, df.shape[1])
                             df.iloc[:, start:end].to_excel(writer, index=False, sheet_name=f"Rows_{part}")
-                            part += 1; start = end
+                            part += 1
+                            start = end
                     else:
                         df.to_excel(writer, index=False, sheet_name="Rows")
                 xlsx_buf.seek(0)
                 base = os.path.splitext(os.path.basename(name))[0]
                 zf.writestr(f"{base}.xlsx", xlsx_buf.read())
-                JOBS[job_id]["stage"] = "written"
+                job_store.update_job(job_id, stage="written")
+                await asyncio.sleep(0)
         out_zip.seek(0)
-        JOBS[job_id].update({"zip_bytes": out_zip, "done": True, "stage": "complete"})
+        job_store.update_job(job_id, zip_bytes=out_zip, done=True, stage="complete")
     except Exception as e:
-        JOBS[job_id].update({"error": str(e), "done": True, "stage": "error"})
+        job_store.update_job(job_id, error=str(e), done=True, stage="error")
 
 @app.get("/progress/{job_id}")
 async def progress(job_id: str):
-    if job_id not in JOBS:
+    if not job_store.get_job(job_id):
         return StreamingResponse(iter([sse("error", {"error": "unknown job"})]), media_type="text/event-stream")
 
     def gen():
-        total = JOBS[job_id]["total"]
         while True:
-            j = JOBS[job_id]
+            j = job_store.get_job(job_id)
+            if not j:
+                yield sse("error", {"error": "unknown job"})
+                return
+            total = j["total"]
             idx = j["index"]
             stage = j["stage"]
             fname = j["file"]
@@ -294,9 +287,11 @@ async def progress(job_id: str):
             err = j["error"]
             percent = int((idx / total) * 100) if total else 0
             if err:
-                yield sse("error", {"error": err}); return
+                yield sse("error", {"error": err})
+                return
             if done and stage == "complete":
-                yield sse("done", {"job_id": job_id}); return
+                yield sse("done", {"job_id": job_id})
+                return
             yield sse("update", {"total": total, "index": idx, "stage": stage, "file": fname, "percent": percent})
             time.sleep(0.4)
 
@@ -304,7 +299,7 @@ async def progress(job_id: str):
 
 @app.get("/download/{job_id}")
 async def download(job_id: str):
-    j = JOBS.get(job_id)
+    j = job_store.get_job(job_id)
     if not j or not j.get("zip_bytes"):
         raise HTTPException(status_code=404, detail="Not ready")
     return StreamingResponse(
