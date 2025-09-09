@@ -1,12 +1,22 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, JSONResponse
 from typing import List, Dict
 import pandas as pd
 import xml.etree.ElementTree as ET
 import io, time, os, threading, zipfile, json
 from collections import defaultdict
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)")
+
+
+@app.exception_handler(Exception)
+async def handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error")
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # ----------- XML helpers (namespace-agnostic) -----------
 
@@ -220,6 +230,7 @@ async def index():
 
 @app.post("/start")
 async def start(files: List[UploadFile] = File(...)):
+    logger.info("Received start request with %d file(s)", len(files) if files else 0)
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
@@ -244,11 +255,13 @@ async def start(files: List[UploadFile] = File(...)):
         "zip_bytes": None,
     }
 
+    logger.info("Enqueued job %s", job_id)
     t = threading.Thread(target=_run_job, args=(job_id, blobs), daemon=True)
     t.start()
     return {"job_id": job_id}
 
 def _run_job(job_id: str, blobs: List[tuple]):
+    logger.info("Running job %s", job_id)
     try:
         total = len(blobs)
         out_zip = io.BytesIO()
@@ -275,7 +288,9 @@ def _run_job(job_id: str, blobs: List[tuple]):
                 JOBS[job_id]["stage"] = "written"
         out_zip.seek(0)
         JOBS[job_id].update({"zip_bytes": out_zip, "done": True, "stage": "complete"})
+        logger.info("Job %s completed", job_id)
     except Exception as e:
+        logger.exception("Job %s failed", job_id)
         JOBS[job_id].update({"error": str(e), "done": True, "stage": "error"})
 
 @app.get("/progress/{job_id}")
@@ -304,9 +319,12 @@ async def progress(job_id: str):
 
 @app.get("/download/{job_id}")
 async def download(job_id: str):
+    logger.info("Download requested for job %s", job_id)
     j = JOBS.get(job_id)
     if not j or not j.get("zip_bytes"):
+        logger.info("Download for job %s not ready", job_id)
         raise HTTPException(status_code=404, detail="Not ready")
+    logger.info("Serving download for job %s", job_id)
     return StreamingResponse(
         j["zip_bytes"],
         media_type="application/zip",
