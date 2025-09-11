@@ -3,13 +3,146 @@ from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import ORJSONResponse
 from typing import List, Dict
-import io, time, os, threading, zipfile, json, uuid
-from celery.result import AsyncResult
+import io, time, os, threading, zipfile, json, uuid, csv, tempfile
 
-from core import xml_rows_to_dataframe  # parsing utils live in core.py
-from tasks import celery, convert_task   # celery app + background task
+from core import xml_rows_to_dataframe, iter_xml_rows  # parsing utils live in core.py
+import pyarrow as pa
+import pyarrow.parquet as pq
+from openpyxl import Workbook
 
 app = FastAPI(title="Simple XML to Excel Converter (Web)", default_response_class=ORJSONResponse)
+
+# In-memory job registry for background threads
+jobs = {}
+jobs_lock = threading.Lock()
+
+def _update_job(job_id: str, **kwargs):
+    with jobs_lock:
+        job = jobs.get(job_id, {})
+        job.update(kwargs)
+        jobs[job_id] = job
+
+def _run_conversion(job_id: str, file_ids: List[str], file_names: List[str], columns: List[str], output_format: str):
+    try:
+        os.makedirs("outputs", exist_ok=True)
+        total = len(file_ids)
+        _update_job(job_id, status="PROGRESS", progress=0, current=0, total=total, file="")
+
+        def stream_csv_to_path(xml_path: str, out_path: str, header_cols: List[str] | None):
+            with open(out_path, "w", newline="", encoding="utf-8") as f:
+                writer = None
+                if header_cols:
+                    writer = csv.DictWriter(f, fieldnames=header_cols, extrasaction='ignore')
+                    writer.writeheader()
+                    for r in iter_xml_rows(xml_path):
+                        writer.writerow(r)
+                else:
+                    first_row = None
+                    for r in iter_xml_rows(xml_path):
+                        first_row = r
+                        break
+                    if first_row is None:
+                        return
+                    header = list(first_row.keys())
+                    writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
+                    writer.writeheader()
+                    writer.writerow(first_row)
+                    for r in iter_xml_rows(xml_path):
+                        writer.writerow(r)
+
+        def stream_parquet_to_path(xml_path: str, out_path: str, header_cols: List[str] | None):
+            header = header_cols if header_cols else None
+            writer = None
+            batch_size = 20000
+            rows_buffer = []
+            for r in iter_xml_rows(xml_path):
+                if header is None:
+                    header = list(r.keys())
+                rows_buffer.append({k: r.get(k) for k in header})
+                if len(rows_buffer) >= batch_size:
+                    table = pa.Table.from_pylist(rows_buffer)
+                    if writer is None:
+                        writer = pq.ParquetWriter(out_path, table.schema)
+                    writer.write_table(table)
+                    rows_buffer.clear()
+            if rows_buffer:
+                table = pa.Table.from_pylist(rows_buffer)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, table.schema)
+                writer.write_table(table)
+                rows_buffer.clear()
+            if writer is not None:
+                writer.close()
+
+        def stream_xlsx_to_path(xml_path: str, out_path: str, header_cols: List[str] | None):
+            wb = Workbook(write_only=True)
+            ws = wb.create_sheet("Rows")
+            header = header_cols if header_cols else None
+            first_row = None
+            it = iter_xml_rows(xml_path)
+            for r in it:
+                first_row = r
+                break
+            if header is None:
+                header = list(first_row.keys()) if first_row else []
+            ws.append(header)
+            if first_row is not None:
+                ws.append([first_row.get(k) for k in header])
+            for r in iter_xml_rows(xml_path):
+                ws.append([r.get(k) for k in header])
+            wb.save(out_path)
+            wb.close()
+
+        if total > 1:
+            zip_path = f"outputs/{job_id}.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for idx, (fid, fname) in enumerate(zip(file_ids, file_names), start=1):
+                    xml_path = f"temp_uploads/{fid}.xml"
+                    if not os.path.exists(xml_path):
+                        raise FileNotFoundError(f"Missing uploaded file: {xml_path}")
+                    base = os.path.splitext(os.path.basename(fname))[0]
+                    _update_job(job_id, current=idx, file=fname, progress=int((idx - 1) / total * 100))
+                    tmp = None
+                    if output_format == "csv":
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv"); tmp.close()
+                        stream_csv_to_path(xml_path, tmp.name, columns if columns else None)
+                        zf.write(tmp.name, arcname=f"{base}.csv")
+                    elif output_format == "parquet":
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet"); tmp.close()
+                        stream_parquet_to_path(xml_path, tmp.name, columns if columns else None)
+                        zf.write(tmp.name, arcname=f"{base}.parquet")
+                    else:
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx"); tmp.close()
+                        stream_xlsx_to_path(xml_path, tmp.name, columns if columns else None)
+                        zf.write(tmp.name, arcname=f"{base}.xlsx")
+                    try:
+                        os.remove(tmp.name)
+                    except Exception:
+                        pass
+                    _update_job(job_id, current=idx, file=fname, progress=int((idx) / total * 100))
+            _update_job(job_id, status="SUCCESS", result_path=zip_path, result_filename="converted_files.zip")
+        else:
+            fid, fname = file_ids[0], file_names[0]
+            xml_path = f"temp_uploads/{fid}.xml"
+            if not os.path.exists(xml_path):
+                raise FileNotFoundError(f"Missing uploaded file: {xml_path}")
+            base = os.path.splitext(os.path.basename(fname))[0]
+            _update_job(job_id, current=1, total=1, file=fname, progress=0)
+            if output_format == "csv":
+                out_path = f"outputs/{job_id}.csv"
+                stream_csv_to_path(xml_path, out_path, columns if columns else None)
+                result_name = f"{base}.csv"
+            elif output_format == "parquet":
+                out_path = f"outputs/{job_id}.parquet"
+                stream_parquet_to_path(xml_path, out_path, columns if columns else None)
+                result_name = f"{base}.parquet"
+            else:
+                out_path = f"outputs/{job_id}.xlsx"
+                stream_xlsx_to_path(xml_path, out_path, columns if columns else None)
+                result_name = f"{base}.xlsx"
+            _update_job(job_id, status="SUCCESS", result_path=out_path, result_filename=result_name, progress=100)
+    except Exception as e:
+        _update_job(job_id, status="FAILURE", error=str(e))
 
 # ----------- In-memory helper for SSE formatting (kept for symmetry) -----------
 def sse(event: str, data: dict) -> str:
@@ -200,7 +333,12 @@ async def index():
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
               });
-              if (!res.ok) throw new Error((await res.json()).detail || 'Failed to start conversion');
+              if (!res.ok) {
+                let msg = '';
+                try { const j = await res.json(); msg = j.detail || JSON.stringify(j); }
+                catch (_) { msg = await res.text(); }
+                throw new Error(msg || 'Failed to start conversion');
+              }
               const data = await res.json();
               jobId = data.job_id;
             } catch (err) {
@@ -212,8 +350,13 @@ async def index():
             // poll status
             const timer = setInterval(async () => {
               const r = await fetch(`/status/${jobId}`);
-              if (!r.ok) return;
-              const s = await r.json();
+              if (!r.ok) {
+                try { const t = await r.text(); statusEl.textContent = `Status error: ${t}`; } catch(_) {}
+                return;
+              }
+              let s;
+              try { s = await r.json(); }
+              catch(_) { statusEl.textContent = 'Status parse error'; return; }
               if (s.status === 'PROGRESS') {
                 const pct = s.progress || 0; bar.style.width = pct + '%';
                 if (s.total && s.total > 1) statusEl.textContent = `Processing ${s.file} (${s.current}/${s.total})`;
@@ -290,46 +433,53 @@ async def start_conversion(payload: Dict):
     if fmt not in ("xlsx", "csv", "parquet"):
         raise HTTPException(status_code=400, detail="format must be xlsx, csv, or parquet")
 
-    task = convert_task.delay(file_ids, file_names, columns, fmt)
-    return {"job_id": task.id}
+    job_id = str(uuid.uuid4())
+    _update_job(job_id, status="QUEUED", progress=0)
+    t = threading.Thread(target=_run_conversion, args=(job_id, file_ids, file_names, columns, fmt), daemon=True)
+    t.start()
+    return {"job_id": job_id}
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    res = AsyncResult(job_id, app=celery)
-    status = res.status
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    status = job.get("status", "PROGRESS")
     if status == "SUCCESS":
         return {"status": "SUCCESS"}
     if status == "FAILURE":
-        error_msg = str(res.result)
-        return {"status": "FAILURE", "error": error_msg}
-    info = res.info or {}
+        return {"status": "FAILURE", "error": job.get("error", "Unknown error")}
     return {
         "status": "PROGRESS",
-        "progress": info.get("progress", 0),
-        "current": info.get("current", 0),
-        "total": info.get("total", 0),
-        "file": info.get("file", "")
+        "progress": job.get("progress", 0),
+        "current": job.get("current", 0),
+        "total": job.get("total", 0),
+        "file": job.get("file", "")
     }
 
 @app.get("/download/{job_id}")
 def download_result(job_id: str):
-    base = f"outputs/{job_id}"
-    if os.path.exists(base + ".zip"):
-        return FileResponse(base + ".zip", media_type="application/zip", filename="converted_files.zip")
-    # single-file outputs
-    for ext, mime in [
-        ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        ("csv", "text/csv"),
-        ("parquet", "application/vnd.apache.parquet"),
-    ]:
-        p = f"{base}.{ext}"
-        if os.path.exists(p):
-            # try to pick friendly filename from result
-            res = AsyncResult(job_id, app=celery)
-            result_meta = res.result if res.status == "SUCCESS" else {}
-            download_name = result_meta.get("filename", f"converted.{ext}")
-            return FileResponse(p, media_type=mime, filename=download_name)
-    raise HTTPException(status_code=404, detail="Result not found")
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "SUCCESS":
+        raise HTTPException(status_code=400, detail="Job not completed")
+    path = job.get("result_path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Result not found")
+    filename = job.get("result_filename") or os.path.basename(path)
+    # infer mime
+    if path.endswith(".zip"):
+        mime = "application/zip"
+    elif path.endswith(".xlsx"):
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif path.endswith(".csv"):
+        mime = "text/csv"
+    elif path.endswith(".parquet"):
+        mime = "application/vnd.apache.parquet"
+    else:
+        mime = "application/octet-stream"
+    return FileResponse(path, media_type=mime, filename=filename)
 
 @app.get("/health", response_class=PlainTextResponse)
 async def health():

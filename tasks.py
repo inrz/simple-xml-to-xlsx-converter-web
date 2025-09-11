@@ -30,8 +30,8 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for idx, (fid, fname) in enumerate(zip(file_ids, file_names), start=1):
                 xml_path = f"temp_uploads/{fid}.xml"
-                with open(xml_path, "rb") as f:
-                    data = f.read()
+                if not os.path.exists(xml_path):
+                    raise FileNotFoundError(f"Missing uploaded file: {xml_path}")
                 base = os.path.splitext(os.path.basename(fname))[0]
                 if output_format == "csv":
                     # Stream CSV rows directly into the zip entry to reduce memory
