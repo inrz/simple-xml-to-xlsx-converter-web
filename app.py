@@ -381,6 +381,10 @@ async def index():
     </html>
     """
 
+@app.head("/")
+async def index_head():
+    return PlainTextResponse("", status_code=200)
+
 # ----------- Preview endpoint (returns 10 rows + union of columns) -----------
 
 @app.post("/preview")
