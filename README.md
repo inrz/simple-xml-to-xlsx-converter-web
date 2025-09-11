@@ -1,72 +1,85 @@
-# simple-xml-to-xlsx-converter-web
-📄 Simple XML to Excel Converter (Web)
+# Simple XML → Excel/CSV/Parquet (Web)
 
-Convert complex XML files into Excel spreadsheets right in your browser.
-This project uses FastAPI + pandas + openpyxl and auto-detects repeating patterns in XML to decide which elements become rows, with all nested fields flattened into columns.
+Fast, low‑memory XML converter with a simple web UI. Upload one or more XML files; the app auto‑detects the repeating element, flattens nested fields to dotted columns, and exports to XLSX, CSV, or Parquet. Conversion runs in a Celery worker so the UI stays responsive.
 
-🚀 Features
+## Highlights
 
-🌐 Web interface – upload XML, get .xlsx back instantly
+- **Auto row detection**: Finds the most repeated element (namespace‑agnostic)
+- **Flatten nested data**: Dotted column names (e.g. `Buyr.AcctOwnr.Id.LEI`)
+- **Streaming exports**:
+  - CSV: streams rows (no full DataFrame in memory)
+  - Parquet: writes in batches via `pyarrow.ParquetWriter`
+  - XLSX: uses `openpyxl` write‑only mode
+- **Preview first**: Shows first 10 rows per file and a unified column set (preview caps to a configurable number of columns for performance)
+- **Multi‑file zips**: Multiple inputs are returned as a single `.zip`
 
-🔍 Auto-detection of repeating elements – no schema assumptions needed
+## Tech
 
-🧩 Flattened structure – nested tags become dotted column names (Buyr.AcctOwnr.Id.LEI)
+- FastAPI (default responses via `orjson`)
+- Celery + Redis (broker & result backend)
+- lxml (streaming parse), pandas (utility, not required for streaming paths)
+- pyarrow, openpyxl
 
-📑 Handles wide XML – splits across multiple sheets if Excel’s 16,384 column limit is exceeded
+## Install
 
-⚡ Lightweight FastAPI app – deployable to free hosting (e.g. Render)
-
-
-🛠 Installation (Local)
-
-Clone repo:
-
+```bash
 git clone https://github.com/<your-username>/simple-xml-to-xlsx-converter-web.git
 cd simple-xml-to-xlsx-converter-web
-
-
-Create a virtual environment:
-
 python -m venv .venv
-source .venv/bin/activate   # macOS/Linux
-.venv\Scripts\activate      # Windows
-
-
-Install dependencies:
-
+# macOS/Linux
+source .venv/bin/activate
+# Windows
+.venv\Scripts\activate
 pip install -r requirements.txt
+```
 
+## Run (local)
 
-Run the app:
+Start Redis (required for Celery). Example via Docker:
 
+```bash
+docker run -p 6379:6379 -d redis:7
+```
+
+Run the web app:
+
+```bash
 uvicorn app:app --reload
+```
 
+Run the Celery worker in another terminal:
 
-Open in browser: http://127.0.0.1:8000
+```bash
+set REDIS_URL=redis://localhost:6379/0  # Windows (PowerShell: $env:REDIS_URL="redis://localhost:6379/0")
+celery -A tasks.celery worker --loglevel=info
+```
 
-🌐 Deploy on Render
+Open: `http://127.0.0.1:8000`
 
-This project is ready for Render free tier:
+## Configuration
 
-Push code to GitHub.
+- `REDIS_URL` (default `redis://localhost:6379/0`)
+- `MAX_PREVIEW_COLUMNS` (default `100`): caps returned column list on preview to keep payload small
 
-Log in to Render
-.
+## Usage notes
 
-Create New Web Service → connect your repo.
+- Preview returns 10 rows per file and a limited union of columns. Hidden columns are still included in export.
+- For CSV/Parquet/XLSX, the worker streams rows to keep memory low. Parquet writes in ~20k row batches.
+- For XLSX, extremely wide tables may exceed Excel’s 16,384 column limit; prefer CSV/Parquet for very wide datasets.
 
-Confirm defaults:
+## Deploy on Render
 
-Build command: pip install -r requirements.txt
+The repo includes `render.yaml` and `Procfile` for a simple Render setup.
 
-Start command: uvicorn app:app --host 0.0.0.0 --port $PORT
+- Build command: `pip install -r requirements.txt`
+- Start command (web): `uvicorn app:app --host 0.0.0.0 --port $PORT`
+- Background worker: Celery with the same `REDIS_URL`
 
-Deploy 🚀
+## Limitations
 
-⚠️ Limitations
+- Free tiers commonly cap request size (~30–50 MB). The app rejects very large uploads.
+- No authentication (public endpoint). Add your own auth/ACL if deploying publicly.
 
-Free tiers typically limit file size (safe ≤ 30–50 MB).
+## License
 
-Parsing very deep XML may flatten into tens of thousands of columns → Excel limits apply.
-
-No authentication: anyone with the URL can use it (see Improvements).
+MIT

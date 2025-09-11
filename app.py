@@ -1,5 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, FileResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import ORJSONResponse
 from typing import List, Dict
 import io, time, os, threading, zipfile, json, uuid
 from celery.result import AsyncResult
@@ -7,7 +9,7 @@ from celery.result import AsyncResult
 from core import xml_rows_to_dataframe  # parsing utils live in core.py
 from tasks import celery, convert_task   # celery app + background task
 
-app = FastAPI(title="Simple XML to Excel Converter (Web)")
+app = FastAPI(title="Simple XML to Excel Converter (Web)", default_response_class=ORJSONResponse)
 
 # ----------- In-memory helper for SSE formatting (kept for symmetry) -----------
 def sse(event: str, data: dict) -> str:
@@ -69,6 +71,7 @@ async def index():
                 <option value="parquet">Parquet</option>
               </select>
             </p>
+            <p class="muted" id="columnsNotice" style="display:none; margin-top:.25rem;"></p>
           </div>
 
           <div class="progress"><div class="bar" id="bar"></div></div>
@@ -150,6 +153,15 @@ async def index():
               const id = 'col_' + col.replace(/[^a-zA-Z0-9_\\-\\.]/g, '_');
               columnsContainer.innerHTML += `<label><input type="checkbox" id="${id}" value="${col}" checked> ${col}</label><br>`;
             });
+            // Show columns limit notice if applicable
+            const notice = document.getElementById('columnsNotice');
+            if (lastPreviewData.hidden_columns_count && lastPreviewData.hidden_columns_count > 0) {
+              notice.style.display = 'block';
+              notice.textContent = `${lastPreviewData.hidden_columns_count} additional columns hidden in preview.`;
+            } else {
+              notice.style.display = 'none';
+              notice.textContent = '';
+            }
             // Show modal
             previewModal.style.display = 'flex';
             previewBtn.disabled = false;
@@ -254,7 +266,13 @@ async def preview_files(files: List[UploadFile] = File(...)):
             f.write(data)
         previews.append({"id": file_id, "name": upload.filename, "columns": columns, "rows": rows})
         all_columns.update(columns)
-    return {"files": previews, "columns": sorted(all_columns)}
+    # Limit number of columns returned to frontend for performance
+    MAX_PREVIEW_COLUMNS = int(os.getenv("MAX_PREVIEW_COLUMNS", "100"))
+    all_columns_list = list(all_columns)
+    all_columns_list.sort()
+    limited_columns = all_columns_list[:MAX_PREVIEW_COLUMNS]
+    hidden_count = max(0, len(all_columns_list) - len(limited_columns))
+    return {"files": previews, "columns": limited_columns, "hidden_columns_count": hidden_count}
 
 # ----------- Background conversion via Celery -----------
 

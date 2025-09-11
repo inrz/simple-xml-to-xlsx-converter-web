@@ -1,9 +1,12 @@
-import os, io, zipfile
+import os, io, zipfile, csv, tempfile
 from typing import List
 import pandas as pd
 from celery import Celery, current_task
 
-from core import xml_rows_to_dataframe
+from core import xml_rows_to_dataframe, iter_xml_rows
+import pyarrow as pa
+import pyarrow.parquet as pq
+from openpyxl import Workbook
 
 # Use REDIS_URL env var if present (Render: set in both web & worker services)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -29,32 +32,112 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
                 xml_path = f"temp_uploads/{fid}.xml"
                 with open(xml_path, "rb") as f:
                     data = f.read()
-                df = xml_rows_to_dataframe(data)
-                if columns:
-                    keep = [c for c in columns if c in df.columns]
-                    df = df[keep] if keep else df
                 base = os.path.splitext(os.path.basename(fname))[0]
                 if output_format == "csv":
-                    zf.writestr(f"{base}.csv", df.to_csv(index=False).encode("utf-8"))
-                elif output_format == "parquet":
-                    buf = io.BytesIO()
-                    df.to_parquet(buf, index=False)
-                    buf.seek(0)
-                    zf.writestr(f"{base}.parquet", buf.read())
-                else:  # xlsx
-                    buf = io.BytesIO()
-                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        MAX_COLS = 16384
-                        if df.shape[1] > MAX_COLS:
-                            start = 0; part = 1
-                            while start < df.shape[1]:
-                                end = min(start + MAX_COLS, df.shape[1])
-                                df.iloc[:, start:end].to_excel(writer, index=False, sheet_name=f"Rows_{part}")
-                                part += 1; start = end
+                    # Stream CSV rows directly into the zip entry to reduce memory
+                    buf = io.StringIO()
+                    writer = None
+                    # Build header from first row, or from provided columns
+                    if columns:
+                        header = columns
+                    else:
+                        # peek first row to get keys
+                        first_row = None
+                        for r in iter_xml_rows(xml_path):
+                            first_row = r
+                            break
+                        if first_row is None:
+                            header = []
                         else:
-                            df.to_excel(writer, index=False, sheet_name="Rows")
-                    buf.seek(0)
-                    zf.writestr(f"{base}.xlsx", buf.read())
+                            header = list(first_row.keys())
+                        # re-iterate including first row
+                        def row_iter():
+                            if first_row is not None:
+                                yield first_row
+                            for r in iter_xml_rows(xml_path):
+                                yield r
+                        rows_it = row_iter()
+                    if columns:
+                        rows_it = iter_xml_rows(xml_path)
+                    writer = csv.DictWriter(buf, fieldnames=header, extrasaction='ignore')
+                    writer.writeheader()
+                    for r in rows_it:
+                        writer.writerow(r)
+                        if buf.tell() > 1_000_000:  # flush in chunks ~1MB
+                            zf.writestr(f"{base}.csv", buf.getvalue().encode("utf-8"))
+                            buf.seek(0); buf.truncate(0)
+                    if buf.tell():
+                        zf.writestr(f"{base}.csv", buf.getvalue().encode("utf-8"))
+                elif output_format == "parquet":
+                    # Stream to a temp parquet file, then add to zip
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
+                    tmp_path = tmp.name
+                    tmp.close()
+                    # Determine schema
+                    header = columns if columns else None
+                    # Build writer after first batch to infer schema
+                    writer = None
+                    batch_size = 20000
+                    rows_buffer = []
+                    def normalize_row(row, header_keys):
+                        if header_keys is None:
+                            header_keys = list(row.keys())
+                        out = {k: row.get(k) for k in header_keys}
+                        return {k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)) for k, v in out.items()}
+                    for r in iter_xml_rows(xml_path):
+                        # establish header if not provided
+                        if header is None:
+                            header = list(r.keys())
+                        rows_buffer.append(normalize_row(r, header))
+                        if len(rows_buffer) >= batch_size:
+                            table = pa.Table.from_pylist(rows_buffer)
+                            if writer is None:
+                                writer = pq.ParquetWriter(tmp_path, table.schema)
+                            writer.write_table(table)
+                            rows_buffer.clear()
+                    if rows_buffer:
+                        table = pa.Table.from_pylist(rows_buffer)
+                        if writer is None:
+                            writer = pq.ParquetWriter(tmp_path, table.schema)
+                        writer.write_table(table)
+                        rows_buffer.clear()
+                    if writer is not None:
+                        writer.close()
+                    # Add to zip and remove temp file
+                    zf.write(tmp_path, arcname=f"{base}.parquet")
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                else:  # xlsx
+                    # Use openpyxl write-only mode to stream rows into a temp file
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+                    tmp_path = tmp.name
+                    tmp.close()
+                    wb = Workbook(write_only=True)
+                    ws = wb.create_sheet("Rows")
+                    # determine header
+                    header = columns if columns else None
+                    first_row = None
+                    it = iter_xml_rows(xml_path)
+                    for r in it:
+                        first_row = r
+                        break
+                    if header is None:
+                        header = list(first_row.keys()) if first_row else []
+                    ws.append(header)
+                    # write first row and rest
+                    if first_row is not None:
+                        ws.append([first_row.get(k) for k in header])
+                    for r in iter_xml_rows(xml_path):
+                        ws.append([r.get(k) for k in header])
+                    wb.save(tmp_path)
+                    wb.close()
+                    zf.write(tmp_path, arcname=f"{base}.xlsx")
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
                 # progress
                 percent = int((idx / total) * 100)
@@ -68,30 +151,81 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
     xml_path = f"temp_uploads/{fid}.xml"
     with open(xml_path, "rb") as f:
         data = f.read()
-    df = xml_rows_to_dataframe(data)
-    if columns:
-        keep = [c for c in columns if c in df.columns]
-        df = df[keep] if keep else df
     base = os.path.splitext(os.path.basename(fname))[0]
     if output_format == "csv":
         out_path = f"outputs/{job_id}.csv"
-        df.to_csv(out_path, index=False)
+        # stream to CSV directly
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = None
+            if columns:
+                writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+                writer.writeheader()
+                for r in iter_xml_rows(xml_path):
+                    writer.writerow(r)
+            else:
+                first_row = None
+                for r in iter_xml_rows(xml_path):
+                    first_row = r
+                    break
+                if first_row is None:
+                    pd.DataFrame([]).to_csv(out_path, index=False)
+                else:
+                    header = list(first_row.keys())
+                    writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
+                    writer.writeheader()
+                    writer.writerow(first_row)
+                    for r in iter_xml_rows(xml_path):
+                        writer.writerow(r)
         result_name = f"{base}.csv"
     elif output_format == "parquet":
         out_path = f"outputs/{job_id}.parquet"
-        df.to_parquet(out_path, index=False)
+        header = columns if columns else None
+        writer = None
+        batch_size = 20000
+        rows_buffer = []
+        def normalize_row(row, header_keys):
+            if header_keys is None:
+                header_keys = list(row.keys())
+            out = {k: row.get(k) for k in header_keys}
+            return {k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)) for k, v in out.items()}
+        for r in iter_xml_rows(xml_path):
+            if header is None:
+                header = list(r.keys())
+            rows_buffer.append(normalize_row(r, header))
+            if len(rows_buffer) >= batch_size:
+                table = pa.Table.from_pylist(rows_buffer)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, table.schema)
+                writer.write_table(table)
+                rows_buffer.clear()
+        if rows_buffer:
+            table = pa.Table.from_pylist(rows_buffer)
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema)
+            writer.write_table(table)
+            rows_buffer.clear()
+        if writer is not None:
+            writer.close()
         result_name = f"{base}.parquet"
     else:
         out_path = f"outputs/{job_id}.xlsx"
-        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-            MAX_COLS = 16384
-            if df.shape[1] > MAX_COLS:
-                start = 0; part = 1
-                while start < df.shape[1]:
-                    end = min(start + MAX_COLS, df.shape[1])
-                    df.iloc[:, start:end].to_excel(writer, index=False, sheet_name=f"Rows_{part}")
-                    part += 1; start = end
-            else:
-                df.to_excel(writer, index=False, sheet_name="Rows")
+        # openpyxl write-only streaming
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet("Rows")
+        header = columns if columns else None
+        first_row = None
+        it = iter_xml_rows(xml_path)
+        for r in it:
+            first_row = r
+            break
+        if header is None:
+            header = list(first_row.keys()) if first_row else []
+        ws.append(header)
+        if first_row is not None:
+            ws.append([first_row.get(k) for k in header])
+        for r in iter_xml_rows(xml_path):
+            ws.append([r.get(k) for k in header])
+        wb.save(out_path)
+        wb.close()
         result_name = f"{base}.xlsx"
     return {"filename": result_name}

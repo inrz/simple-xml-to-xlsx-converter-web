@@ -1,6 +1,13 @@
 import pandas as pd
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from typing import Iterator, Dict, Any, List
+
+try:
+    from lxml import etree as LET
+    HAS_LXML = True
+except Exception:
+    HAS_LXML = False
 
 # ----------- XML helpers (namespace-agnostic) -----------
 
@@ -94,5 +101,96 @@ def xml_rows_to_dataframe(xml_bytes: bytes) -> pd.DataFrame:
         rows.append(flat)
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.reindex(columns=sorted(df.columns))  # deterministic order
+        # Keep original order by default; caller can reindex if needed
+        pass
     return df
+
+
+# ----------- Streaming row generator (lxml.iterparse) -----------
+
+def iter_xml_rows(xml_path: str) -> Iterator[Dict[str, Any]]:
+    """Yield flattened row dicts by streaming the XML file.
+
+    Heuristic: same as detect_repeating_rows, but in streaming form we need a
+    target tag. We first do a light pass to find the most repeated child tag
+    name, then do a second pass yielding each element of that tag.
+    Falls back to root children if no repetition found.
+    """
+    if not HAS_LXML:
+        # Fallback: load whole file (non-streaming)
+        with open(xml_path, "rb") as f:
+            data = f.read()
+        df = xml_rows_to_dataframe(data)
+        for _, row in df.iterrows():
+            yield {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
+        return
+
+    # First pass: detect candidate row tag by counting sibling repetitions
+    best_name = None
+    best_count = 0
+    context = LET.iterparse(xml_path, events=("start", "end"))
+    stack_names: List[str] = []
+    sibling_counts_stack: List[defaultdict] = []
+    for event, elem in context:
+        if event == "start":
+            stack_names.append(elem.tag)
+            sibling_counts_stack.append(defaultdict(int))
+        else:  # end
+            # update parent sibling count
+            if len(sibling_counts_stack) >= 2:
+                parent_counts = sibling_counts_stack[-2]
+                local = elem.tag.split('}', 1)[1] if '}' in elem.tag else elem.tag
+                parent_counts[local] += 1
+                c = parent_counts[local]
+                if c >= 2 and c > best_count:
+                    best_count = c
+                    best_name = local
+            # pop stacks when element ends
+            stack_names.pop()
+            sibling_counts_stack.pop()
+            # clear from memory
+            elem.clear()
+    del context
+
+    # Second pass: stream over chosen tag
+    target_local = best_name
+    # If we didn't find a repeated tag, we try the first child name under root
+    if target_local is None:
+        context = LET.iterparse(xml_path, events=("start", "end"))
+        root_seen = False
+        first_child_local = None
+        for event, elem in context:
+            if event == "start" and not root_seen:
+                # root start
+                root_seen = True
+            elif event == "start" and root_seen and first_child_local is None:
+                first_child_local = elem.tag.split('}', 1)[1] if '}' in elem.tag else elem.tag
+                break
+        del context
+        target_local = first_child_local
+
+    if target_local is None:
+        # Give up: no structure, parse whole
+        with open(xml_path, "rb") as f:
+            data = f.read()
+        df = xml_rows_to_dataframe(data)
+        for _, row in df.iterrows():
+            yield {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
+        return
+
+    # Now iterate and yield per target element end
+    ns_agnostic_suffix = "}" + target_local
+    context = LET.iterparse(xml_path, events=("end",))
+    for event, elem in context:
+        tag = elem.tag
+        is_match = False
+        if '}' in tag:
+            is_match = tag.endswith(ns_agnostic_suffix)
+        else:
+            is_match = (tag == target_local)
+        if is_match:
+            obj = element_to_dict(elem)
+            flat = flatten_dict_all(obj)
+            yield flat
+            elem.clear()
+    del context
