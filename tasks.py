@@ -38,31 +38,40 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
                     buf = io.StringIO()
                     writer = None
                     # Build header from first row, or from provided columns
-                    if columns:
-                        header = columns
+                    if columns is not None:
+                        header = list(columns)
+                        if not header:
+                            # nothing to write for this file
+                            continue
                     else:
                         # peek first row to get keys
                         first_row = None
                         for r in iter_xml_rows(xml_path):
                             first_row = r
                             break
-                        if first_row is None:
+                        if first_row is None or not first_row:
                             header = []
                         else:
                             header = list(first_row.keys())
                         # re-iterate including first row
                         def row_iter():
-                            if first_row is not None:
-                                yield first_row
+                            if first_row is not None and any((first_row.get(k) is not None and first_row.get(k) != "") for k in header):
+                                yield {k: first_row.get(k) for k in header}
                             for r in iter_xml_rows(xml_path):
-                                yield r
+                                if any((r.get(k) is not None and r.get(k) != "") for k in header):
+                                    yield {k: r.get(k) for k in header}
                         rows_it = row_iter()
-                    if columns:
-                        rows_it = iter_xml_rows(xml_path)
+                    if columns is not None:
+                        def rows_filtered():
+                            for r in iter_xml_rows(xml_path):
+                                if any((r.get(k) is not None and r.get(k) != "") for k in header):
+                                    yield {k: r.get(k) for k in header}
+                        rows_it = rows_filtered()
                     writer = csv.DictWriter(buf, fieldnames=header, extrasaction='ignore')
-                    writer.writeheader()
-                    for r in rows_it:
-                        writer.writerow(r)
+                    if header:
+                        writer.writeheader()
+                        for r in rows_it:
+                            writer.writerow(r)
                         if buf.tell() > 1_000_000:  # flush in chunks ~1MB
                             zf.writestr(f"{base}.csv", buf.getvalue().encode("utf-8"))
                             buf.seek(0); buf.truncate(0)
@@ -117,7 +126,7 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
                     wb = Workbook(write_only=True)
                     ws = wb.create_sheet("Rows")
                     # determine header
-                    header = columns if columns else None
+                    header = list(columns) if columns is not None else None
                     first_row = None
                     it = iter_xml_rows(xml_path)
                     for r in it:
@@ -125,12 +134,17 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
                         break
                     if header is None:
                         header = list(first_row.keys()) if first_row else []
-                    ws.append(header)
-                    # write first row and rest
-                    if first_row is not None:
-                        ws.append([first_row.get(k) for k in header])
-                    for r in iter_xml_rows(xml_path):
-                        ws.append([r.get(k) for k in header])
+                    if header:
+                        ws.append(header)
+                        # write first row and rest
+                        if first_row is not None:
+                            row_vals = [first_row.get(k) for k in header]
+                            if any((v is not None and v != "") for v in row_vals):
+                                ws.append(row_vals)
+                        for r in iter_xml_rows(xml_path):
+                            row_vals = [r.get(k) for k in header]
+                            if any((v is not None and v != "") for v in row_vals):
+                                ws.append(row_vals)
                     wb.save(tmp_path)
                     wb.close()
                     zf.write(tmp_path, arcname=f"{base}.xlsx")
@@ -157,25 +171,31 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
         # stream to CSV directly
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             writer = None
-            if columns:
-                writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+            if columns is not None:
+                header = list(columns)
+                if not header:
+                    return {"filename": f"{base}.csv"}
+                writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
                 writer.writeheader()
                 for r in iter_xml_rows(xml_path):
-                    writer.writerow(r)
+                    if any((r.get(k) is not None and r.get(k) != "") for k in header):
+                        writer.writerow({k: r.get(k) for k in header})
             else:
                 first_row = None
                 for r in iter_xml_rows(xml_path):
                     first_row = r
                     break
-                if first_row is None:
+                if first_row is None or not first_row:
                     pd.DataFrame([]).to_csv(out_path, index=False)
                 else:
                     header = list(first_row.keys())
                     writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
                     writer.writeheader()
-                    writer.writerow(first_row)
+                    if any((first_row.get(k) is not None and first_row.get(k) != "") for k in header):
+                        writer.writerow({k: first_row.get(k) for k in header})
                     for r in iter_xml_rows(xml_path):
-                        writer.writerow(r)
+                        if any((r.get(k) is not None and r.get(k) != "") for k in header):
+                            writer.writerow({k: r.get(k) for k in header})
         result_name = f"{base}.csv"
     elif output_format == "parquet":
         out_path = f"outputs/{job_id}.parquet"
@@ -212,7 +232,7 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
         # openpyxl write-only streaming
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Rows")
-        header = columns if columns else None
+        header = list(columns) if columns is not None else None
         first_row = None
         it = iter_xml_rows(xml_path)
         for r in it:
@@ -220,11 +240,16 @@ def convert_task(self, file_ids: List[str], file_names: List[str], columns: List
             break
         if header is None:
             header = list(first_row.keys()) if first_row else []
-        ws.append(header)
-        if first_row is not None:
-            ws.append([first_row.get(k) for k in header])
-        for r in iter_xml_rows(xml_path):
-            ws.append([r.get(k) for k in header])
+        if header:
+            ws.append(header)
+            if first_row is not None:
+                row_vals = [first_row.get(k) for k in header]
+                if any((v is not None and v != "") for v in row_vals):
+                    ws.append(row_vals)
+            for r in iter_xml_rows(xml_path):
+                row_vals = [r.get(k) for k in header]
+                if any((v is not None and v != "") for v in row_vals):
+                    ws.append(row_vals)
         wb.save(out_path)
         wb.close()
         result_name = f"{base}.xlsx"

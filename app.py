@@ -31,24 +31,30 @@ def _run_conversion(job_id: str, file_ids: List[str], file_names: List[str], col
         def stream_csv_to_path(xml_path: str, out_path: str, header_cols: List[str] | None):
             with open(out_path, "w", newline="", encoding="utf-8") as f:
                 writer = None
-                if header_cols:
-                    writer = csv.DictWriter(f, fieldnames=header_cols, extrasaction='ignore')
+                if header_cols is not None:
+                    header = list(header_cols)
+                    if not header:
+                        return
+                    writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
                     writer.writeheader()
                     for r in iter_xml_rows(xml_path):
-                        writer.writerow(r)
+                        if any((r.get(k) is not None and r.get(k) != "") for k in header):
+                            writer.writerow({k: r.get(k) for k in header})
                 else:
                     first_row = None
                     for r in iter_xml_rows(xml_path):
                         first_row = r
                         break
-                    if first_row is None:
+                    if first_row is None or not first_row:
                         return
                     header = list(first_row.keys())
                     writer = csv.DictWriter(f, fieldnames=header, extrasaction='ignore')
                     writer.writeheader()
-                    writer.writerow(first_row)
+                    if any((first_row.get(k) is not None and first_row.get(k) != "") for k in header):
+                        writer.writerow({k: first_row.get(k) for k in header})
                     for r in iter_xml_rows(xml_path):
-                        writer.writerow(r)
+                        if any((r.get(k) is not None and r.get(k) != "") for k in header):
+                            writer.writerow({k: r.get(k) for k in header})
 
         def stream_parquet_to_path(xml_path: str, out_path: str, header_cols: List[str] | None):
             header = header_cols if header_cols else None
@@ -85,11 +91,19 @@ def _run_conversion(job_id: str, file_ids: List[str], file_names: List[str], col
                 break
             if header is None:
                 header = list(first_row.keys()) if first_row else []
+            if not header:
+                wb.save(out_path)
+                wb.close()
+                return
             ws.append(header)
             if first_row is not None:
-                ws.append([first_row.get(k) for k in header])
+                row_vals = [first_row.get(k) for k in header]
+                if any((v is not None and v != "") for v in row_vals):
+                    ws.append(row_vals)
             for r in iter_xml_rows(xml_path):
-                ws.append([r.get(k) for k in header])
+                row_vals = [r.get(k) for k in header]
+                if any((v is not None and v != "") for v in row_vals):
+                    ws.append(row_vals)
             wb.save(out_path)
             wb.close()
 
